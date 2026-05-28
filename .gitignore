@@ -1,0 +1,4 @@
+bin/
+.nextflow/
+.nextflow.log*
+work/
