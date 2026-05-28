@@ -36,6 +36,18 @@ def ensureDnatco() {
 
 workflow {
     main:
+    if (!params.input) {
+        error """
+        ERROR: --input is required
+
+        Usage:
+          nextflow run main.nf --input /path/to/structure.cif
+          nextflow run main.nf --input '/data/*.cif.gz'
+
+        Accepted formats: .cif, .cif.gz
+        """.stripIndent()
+    }
+
     ensureDnatco()
 
     channel
