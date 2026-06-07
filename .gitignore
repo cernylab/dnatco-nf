@@ -1,4 +1,5 @@
 bin/
+.canvas/
 .nextflow/
 .nextflow.log*
 work/

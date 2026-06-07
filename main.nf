@@ -1,27 +1,122 @@
 #!/usr/bin/env nextflow
 
-include { DNATCO_CLASSIFY } from './modules/dnatco_classify'
+include { DNATCO_CLASSIFY; DNATCO_INFO } from './modules/dnatco_classify'
 
-def ensureDnatco() {
-    if (new File("${projectDir}/bin/dnatco.js").exists()) return
+// Is a Docker image already present locally (so it won't need pulling)?
+def imageAvailable(String image) {
+    try {
+        def p = ["docker", "image", "inspect", image].execute()
+        p.consumeProcessOutput()
+        p.waitFor()
+        return p.exitValue() == 0
+    }
+    catch (IOException e) {
+        return false
+    }
+}
 
-    log.info "dnatco standalone not found — fetching latest release from GitHub..."
+def ensureDocker(boolean offline) {
+    // dnatco.js only ever runs inside the 'node:22' Docker container, so a working
+    // Docker daemon is required before we attempt anything (including pulling dnatco).
+    // 'docker info' both proves the binary exists and that the daemon is responding.
+    def ok = false
+    try {
+        def proc = ["docker", "info"].execute()
+        proc.consumeProcessOutput()   // drain stdout/stderr so the process can't block
+        proc.waitFor()
+        ok = (proc.exitValue() == 0)
+    }
+    catch (IOException e) {
+        ok = false                    // docker binary not on PATH
+    }
+    if (!ok) {
+        error """
+        ERROR: Docker is not available.
 
-    def conn = new URL("https://api.github.com/repos/cernylab/dnatco/releases/latest").openConnection()
-    conn.setRequestProperty("Accept", "application/vnd.github.v3+json")
-    conn.setRequestProperty("User-Agent", "nextflow-dnatco-pipeline")
-    def json = new groovy.json.JsonSlurper().parse(conn.inputStream)
-    def asset = json.assets.find { it.name.endsWith("_standalone.zip") }
+        This pipeline runs dnatco.js inside the 'node:22' Docker container, so a working
+        Docker installation with a running daemon is required.
+
+        Verify with:  docker info
+        """.stripIndent()
+    }
+
+    // Every container step uses 'node:22'. Offline we can't pull it, so fail early with a
+    // clear message rather than letting each task fail on an image pull.
+    if (offline && !imageAvailable('node:22')) {
+        error """
+        ERROR: the 'node:22' Docker image is not available locally and --offline is set.
+
+        Pull it once while online ('docker pull node:22'), or re-run without --offline.
+        """.stripIndent()
+    }
+}
+
+// Fetch the latest release metadata from GitHub. Best-effort: returns null on any failure
+// (offline, DNS, rate-limited, ...) so an update check never breaks a run.
+def fetchLatestRelease() {
+    try {
+        def conn = new URL("https://api.github.com/repos/cernylab/dnatco/releases/latest").openConnection()
+        conn.setRequestProperty("Accept", "application/vnd.github.v3+json")
+        conn.setRequestProperty("User-Agent", "nextflow-dnatco-pipeline")
+        conn.connectTimeout = 5000
+        conn.readTimeout = 5000
+        return new groovy.json.JsonSlurper().parse(conn.inputStream)
+    }
+    catch (Exception e) {
+        return null
+    }
+}
+
+def ensureDnatco(boolean offline, boolean force) {
+    def bin       = "${projectDir}/bin"
+    def relFile   = new File("${bin}/.release")
+    def installed = new File("${bin}/dnatco.js").exists()
+
+    // Already installed and not forcing an update: keep the local copy. When online, do a
+    // best-effort check and tell the user (without blocking) if a newer release exists.
+    if (installed && !force) {
+        if (!offline) {
+            def latest    = fetchLatestRelease()
+            def latestTag = latest?.tag_name
+            def localTag  = relFile.exists() ? relFile.text.trim() : null
+            if (latestTag && localTag && latestTag != localTag) {
+                log.warn "A newer dnatco release is available: ${latestTag} (installed: ${localTag}). " +
+                         "Re-run with --updateDnatco to upgrade."
+            }
+        }
+        return
+    }
+
+    // From here we'd need to download (first install, or forced update) — impossible offline.
+    if (offline) {
+        if (installed) {
+            log.warn "--updateDnatco ignored because --offline is set; using the existing local copy."
+            return
+        }
+        error """
+        ERROR: dnatco standalone is not present in ${bin} and --offline is set, so it cannot be downloaded.
+
+        Re-run without --offline to fetch it from GitHub, or provide a populated bin/ directory.
+        """.stripIndent()
+    }
+
+    log.info installed
+        ? "Updating dnatco standalone (--updateDnatco): fetching latest release from GitHub..."
+        : "dnatco standalone not found — fetching latest release from GitHub..."
+
+    def json = fetchLatestRelease()
+    if (!json) throw new Exception("Could not fetch the latest dnatco release from GitHub")
+    def asset = json.assets.find { a -> a.name.endsWith("_standalone.zip") }
     if (!asset) throw new Exception("No _standalone.zip asset found in latest GitHub release")
 
-    log.info "Downloading ${asset.name} ..."
+    log.info "Downloading ${asset.name} (${json.tag_name}) ..."
     def cmd = """
         set -euo pipefail
         TMP=\$(mktemp -d)
         trap "rm -rf \$TMP" EXIT
         curl -L --progress-bar -o "\$TMP/${asset.name}" "${asset.browser_download_url}"
         unzip -q "\$TMP/${asset.name}" -d "\$TMP/x"
-        rm -rf "${projectDir}/bin"
+        rm -rf "${bin}"
         mv "\$TMP/x/dnatco/bin" "${projectDir}/"
     """.stripIndent()
 
@@ -31,46 +126,146 @@ def ensureDnatco() {
     proc.waitFor()
     if (proc.exitValue() != 0) throw new Exception("Failed to install dnatco standalone tool")
 
-    log.info "dnatco installed to ${projectDir}/bin"
+    // Record the installed release tag so later runs can detect newer releases.
+    new File("${bin}/.release").text = json.tag_name ?: ''
+    log.info "dnatco ${json.tag_name ?: ''} installed to ${bin}"
+}
+
+// Does the canvas installed in the cache dir actually load under node:22?
+// (--security-opt label=disable mirrors docker.runOptions so SELinux doesn't block the
+// bind mount; these docker calls run directly, not through Nextflow's container handling.)
+def canvasCacheLoads(String cache, String uidgid) {
+    def p = ["docker", "run", "--rm", "--security-opt", "label=disable", "--user", uidgid, "-e", "HOME=/tmp",
+             "-v", "${cache}:/c:ro", "node:22",
+             "node", "-e", "require('/c/node_modules/canvas')"].execute()
+    p.consumeProcessOutput()
+    p.waitFor()
+    return p.exitValue() == 0
+}
+
+// Provide a working native 'canvas' (needed for --report's PDF). The canvas bundled in the
+// dnatco standalone is built for a different environment and fails to load under node:22 on
+// both x64 and arm. Rather than rewrite the bundled bin/ (often read-only / not writable by
+// the container user — EACCES on shared or remote installs), install a matching canvas
+// version into a writable cache dir we own; the runtime then bind-mounts it over
+// bin/node_modules. Returns the host path to the cache's node_modules, or null if no working
+// canvas could be produced — so the caller can carry on without the PDF instead of failing.
+def ensureCanvas(boolean offline) {
+    def bin    = "${projectDir}/bin"
+    def cache  = "${projectDir}/.canvas"
+    def uidgid = "${['id','-u'].execute().text.trim()}:${['id','-g'].execute().text.trim()}"
+
+    // Match the version the bundle expects, for API compatibility.
+    def version = new groovy.json.JsonSlurper()
+        .parse(new File("${bin}/node_modules/canvas/package.json")).version
+
+    // Reuse the cache if it already holds a loadable canvas of the right version.
+    def cachedPkg = new File("${cache}/node_modules/canvas/package.json")
+    def cachedVer = cachedPkg.exists() ? new groovy.json.JsonSlurper().parse(cachedPkg).version : null
+    if (cachedVer == version && canvasCacheLoads(cache, uidgid)) return "${cache}/node_modules"
+
+    // Installing canvas needs the network; under --offline we can only use a prebuilt cache.
+    if (offline) {
+        log.warn "Cannot prepare 'canvas' for --report while --offline is set (npm install needs network)."
+        return null
+    }
+
+    log.info "Preparing native canvas@${version} for --report in ${cache} ..."
+    new File(cache).mkdirs()
+    def install = ["docker", "run", "--rm", "--security-opt", "label=disable", "--user", uidgid, "-e", "HOME=/tmp",
+                   "-v", "${cache}:/c", "-w", "/c", "node:22",
+                   "npm", "install", "--no-save", "--no-audit", "--no-fund", "canvas@${version}"].execute()
+    install.consumeProcessOutputStream(System.out)
+    install.consumeProcessErrorStream(System.err)
+    install.waitFor()
+
+    if (install.exitValue() != 0 || !canvasCacheLoads(cache, uidgid)) return null
+
+    log.info "Native 'canvas' ready."
+    return "${cache}/node_modules"
 }
 
 workflow {
     main:
-    if (!params.input) {
-        error """
-        ERROR: --input is required
+    // Informational switches short-circuit everything else: run dnatco.js with
+    // just that switch. --help takes precedence over --version.
+    def infoFlag = params.help ? 'help' : (params.version ? 'version' : null)
 
-        Usage:
-          nextflow run main.nf --input /path/to/structure.cif
-          nextflow run main.nf --input '/data/*.cif.gz'
+    // Network control: --offline disables all pipeline-initiated network ops; --updateDnatco
+    // forces a re-download of the dnatco standalone (ignored under --offline).
+    def offline = (params.offline == true || params.offline == 'true')
+    def force   = (params.updateDnatco == true || params.updateDnatco == 'true')
 
-        Accepted formats: .cif, .cif.gz
-        """.stripIndent()
+    ensureDocker(offline)
+    ensureDnatco(offline, force)
+
+    if (infoFlag) {
+        if (infoFlag == 'help' && params.version) {
+            log.warn "Both --help and --version given; running --help (--version ignored)."
+        }
+        log.warn "Running 'dnatco.js --${infoFlag}' only; all other switches and inputs are ignored."
+        DNATCO_INFO(channel.of(infoFlag))
+    }
+    else {
+        // '--input' is a synonym for dnatco.js' --coords.
+        def coords = params.input ?: params.coords
+        if (!coords) {
+            error """
+            ERROR: --input (alias --coords) is required
+
+            Usage:
+              nextflow run main.nf --input /path/to/structure.cif
+              nextflow run main.nf --input '/data/*.cif.gz'
+
+            Accepted formats: .cif, .cif.gz
+
+            Any other dnatco.js switch is forwarded as-is, e.g.:
+              nextflow run main.nf --input structure.cif --ntcJson --reportText
+              nextflow run main.nf --input structure.cif --restraintsRmsd 0.4
+
+            See all dnatco.js switches with:
+              nextflow run main.nf --help
+            """.stripIndent()
+        }
+
+        // --reflns (and the RSCC/density-correlation features that depend on it) is not
+        // supported here: it requires external programs to compute the density correlations.
+        if (params.reflns) {
+            log.warn "--reflns is not supported by this pipeline (RSCC / density correlation " +
+                     "requires external programs); the supplied reflections file will be ignored."
+        }
+
+        // --report needs the native 'canvas' module. Prepare a working one in a cache dir
+        // (bind-mounted over bin/node_modules at runtime). If it can't be made to work on
+        // this platform, skip the PDF (warn) rather than failing the whole run — the
+        // remaining outputs are still produced. canvasMount = '' means "no --report".
+        def canvasMount = ''
+        if (params.report == true || params.report == 'true') {
+            canvasMount = ensureCanvas(offline) ?: ''
+            if (!canvasMount) {
+                log.warn "--report PDF will NOT be generated: a working 'canvas' module could not " +
+                         "be prepared on this platform. Continuing with the other outputs."
+            }
+        }
+
+        def inputs = channel
+            .fromPath(coords, checkIfExists: true)
+            .map { cif ->
+                if (!cif.name.endsWith('.cif') && !cif.name.endsWith('.cif.gz')) {
+                    error "Input must be a .cif or .cif.gz file: ${cif}"
+                }
+                tuple(cif.parent, cif)
+            }
+
+        DNATCO_CLASSIFY(inputs, canvasMount)
     }
 
-    ensureDnatco()
-
-    channel
-        .fromPath(params.input, checkIfExists: true)
-        .map { cif ->
-            if (!cif.name.endsWith('.cif') && !cif.name.endsWith('.cif.gz')) {
-                error "Input must be a .cif or .cif.gz file: ${cif}"
-            }
-            tuple(cif.parent, cif)
-        }
-        | DNATCO_CLASSIFY
-
     publish:
-    extended_cif = DNATCO_CLASSIFY.out.extended_cif
-    naval_json   = DNATCO_CLASSIFY.out.naval_json
+    results = infoFlag ? channel.empty() : DNATCO_CLASSIFY.out.results
 }
 
 output {
-    extended_cif {
-        path { outdir, _file -> outdir.toString() }
-        mode 'copy'
-    }
-    naval_json {
+    results {
         path { outdir, _file -> outdir.toString() }
         mode 'copy'
     }
