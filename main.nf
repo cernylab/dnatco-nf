@@ -228,11 +228,21 @@ workflow {
             """.stripIndent()
         }
 
-        // --reflns (and the RSCC/density-correlation features that depend on it) is not
-        // supported here: it requires external programs to compute the density correlations.
-        if (params.reflns) {
-            log.warn "--reflns is not supported by this pipeline (RSCC / density correlation " +
-                     "requires external programs); the supplied reflections file will be ignored."
+        // dnatco.js switches the pipeline disables: either it sets them itself (so a user
+        // value would be overwritten) or the feature isn't supported here. None are forwarded
+        // to dnatco.js (see the 'managed' list in the DNATCO_CLASSIFY module). They aren't
+        // declared in nextflow.config, so a non-null value means the user passed it — warn
+        // for each so an ignored switch never looks effective.
+        def disabledSwitches = [
+            prefix   : "the pipeline derives the output prefix from the input name and --outpref",
+            outputDir: "the pipeline always writes outputs into the task/publish directory",
+            reflns   : "RSCC / density correlation is not supported here (it needs external programs)",
+        ]
+        disabledSwitches.each { sw, why ->
+            if (params[sw] != null) {
+                log.warn "--${sw} is not passed to dnatco.js (${why}); the supplied value " +
+                         "'${params[sw]}' is ignored."
+            }
         }
 
         // --report needs the native 'canvas' module. Prepare a working one in a cache dir

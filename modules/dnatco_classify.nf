@@ -32,10 +32,10 @@ process DNATCO_CLASSIFY {
     val canvasMount
 
     output:
-    tuple val(outdir), path("${cif.simpleName}_dnatco_*"), emit: results
+    tuple val(outdir), path("${cif.simpleName}_${params.outpref}_*"), emit: results, optional: true
 
     script:
-    def prefix    = "${cif.simpleName}_dnatco"
+    def prefix    = "${cif.simpleName}_${params.outpref}"
     def coordsCmd = cif.name.endsWith('.gz') ? "gunzip -c \$(pwd)/${cif} > \$(pwd)/${cif.baseName}" : ""
     def coordsArg = "\$(pwd)/" + (cif.name.endsWith('.gz') ? cif.baseName : cif.name)
 
@@ -47,7 +47,8 @@ process DNATCO_CLASSIFY {
     // A bare flag on the command line (e.g. --ntcJson) reaches us as the *string*
     // "true", while config defaults (extendedCIF = true) are real booleans; treat
     // both alike so a switch never gets a spurious "true" value appended.
-    def managed = ['input', 'coords', 'reflns', 'prefix', 'outputDir', 'outpref', 'dnatco_bin', 'help', 'version', 'report']
+    def managed = ['input', 'coords', 'reflns', 'prefix', 'outputDir', 'outpref', 'dnatco_bin',
+                   'help', 'version', 'report', 'updateDnatco', 'offline']
     def passThrough = params
         .findAll { k, v -> !(k in managed) && v != null && v != false && v != 'false' }
         .collect { k, v -> (v == true || v == 'true') ? "--${k}" : "--${k} ${v}" }
