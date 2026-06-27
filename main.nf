@@ -2,10 +2,49 @@
 
 include { DNATCO_CLASSIFY; DNATCO_INFO } from './modules/dnatco_classify'
 
-// Is a Docker image already present locally (so it won't need pulling)?
-def imageAvailable(String image) {
+// True on Linux hosts. Gates Linux-only container options (SELinux relabeling, host-uid
+// mapping) that are meaningless or rejected elsewhere: on macOS/Windows Docker Desktop the
+// file-sharing layer maps ownership itself, and engines like Apple 'container' reject the
+// SELinux flag.
+def isLinuxHost() {
+    System.getProperty('os.name')?.toLowerCase()?.contains('linux')
+}
+
+// Host-side run options for our *manual* engine calls (the canvas helpers below), matching
+// what nextflow.config applies to Nextflow-managed tasks. Empty off Linux. On Linux docker
+// gets '--user' so outputs are owned by the host user; rootless podman must NOT set it
+// (container-root already maps to the host user, and forcing --user yields outputs owned by
+// an unusable subuid), so it gets only the SELinux relabel.
+def hostEngineOpts(String engine, String uidgid) {
+    if (!isLinuxHost()) return []
+    return engine == 'podman'
+        ? ['--security-opt', 'label=disable']
+        : ['--security-opt', 'label=disable', '--user', uidgid]
+}
+
+// Is the engine installed and its daemon responding? 'info' is the canonical check, but some
+// docker-CLI-compatible engines (e.g. Apple 'container') have no 'info' subcommand; fall back
+// to an image listing, which also requires a running daemon.
+def engineProbe(List<String> args) {
     try {
-        def p = ["docker", "image", "inspect", image].execute()
+        def p = args.execute()
+        p.consumeProcessOutput()          // drain stdout/stderr so the process can't block
+        p.waitFor()
+        return p.exitValue() == 0
+    }
+    catch (IOException e) {
+        return false                      // binary not on PATH, or probe unsupported
+    }
+}
+
+def engineResponds(String engine) {
+    return engineProbe([engine, 'info']) || engineProbe([engine, 'image', 'ls'])
+}
+
+// Is an image already present locally (so it won't need pulling)?
+def imageAvailable(String engine, String image) {
+    try {
+        def p = [engine, "image", "inspect", image].execute()
         p.consumeProcessOutput()
         p.waitFor()
         return p.exitValue() == 0
@@ -15,38 +54,27 @@ def imageAvailable(String image) {
     }
 }
 
-def ensureDocker(boolean offline) {
-    // dnatco.js only ever runs inside the 'node:22' Docker container, so a working
-    // Docker daemon is required before we attempt anything (including pulling dnatco).
-    // 'docker info' both proves the binary exists and that the daemon is responding.
-    def ok = false
-    try {
-        def proc = ["docker", "info"].execute()
-        proc.consumeProcessOutput()   // drain stdout/stderr so the process can't block
-        proc.waitFor()
-        ok = (proc.exitValue() == 0)
-    }
-    catch (IOException e) {
-        ok = false                    // docker binary not on PATH
-    }
-    if (!ok) {
+def ensureEngine(String engine, boolean offline) {
+    // dnatco.js only ever runs inside the 'node:22' container, so a working container engine
+    // is required before we attempt anything (including pulling dnatco).
+    if (!engineResponds(engine)) {
         error """
-        ERROR: Docker is not available.
+        ERROR: the '${engine}' container engine is not available.
 
-        This pipeline runs dnatco.js inside the 'node:22' Docker container, so a working
-        Docker installation with a running daemon is required.
+        This pipeline runs dnatco.js inside the 'node:22' container, so a working ${engine}
+        installation with a running daemon is required.
 
-        Verify with:  docker info
+        Verify with:  ${engine} info
         """.stripIndent()
     }
 
     // Every container step uses 'node:22'. Offline we can't pull it, so fail early with a
     // clear message rather than letting each task fail on an image pull.
-    if (offline && !imageAvailable('node:22')) {
+    if (offline && !imageAvailable(engine, 'node:22')) {
         error """
-        ERROR: the 'node:22' Docker image is not available locally and --offline is set.
+        ERROR: the 'node:22' image is not available locally and --offline is set.
 
-        Pull it once while online ('docker pull node:22'), or re-run without --offline.
+        Pull it once while online ('${engine} pull node:22'), or re-run without --offline.
         """.stripIndent()
     }
 }
@@ -132,12 +160,13 @@ def ensureDnatco(boolean offline, boolean force) {
 }
 
 // Does the canvas installed in the cache dir actually load under node:22?
-// (--security-opt label=disable mirrors docker.runOptions so SELinux doesn't block the
-// bind mount; these docker calls run directly, not through Nextflow's container handling.)
-def canvasCacheLoads(String cache, String uidgid) {
-    def p = ["docker", "run", "--rm", "--security-opt", "label=disable", "--user", uidgid, "-e", "HOME=/tmp",
-             "-v", "${cache}:/c:ro", "node:22",
-             "node", "-e", "require('/c/node_modules/canvas')"].execute()
+// (hostEngineOpts mirrors the engine's run options per-platform so SELinux doesn't block the
+// bind mount on Linux; these calls run the engine directly, not via Nextflow's container handling.)
+def canvasCacheLoads(String engine, String cache, String uidgid) {
+    def cmd = [engine, "run", "--rm"] + hostEngineOpts(engine, uidgid) +
+              ["-e", "HOME=/tmp", "-v", "${cache}:/c:ro", "node:22",
+               "node", "-e", "require('/c/node_modules/canvas')"]
+    def p = cmd.execute()
     p.consumeProcessOutput()
     p.waitFor()
     return p.exitValue() == 0
@@ -150,7 +179,7 @@ def canvasCacheLoads(String cache, String uidgid) {
 // version into a writable cache dir we own; the runtime then bind-mounts it over
 // bin/node_modules. Returns the host path to the cache's node_modules, or null if no working
 // canvas could be produced — so the caller can carry on without the PDF instead of failing.
-def ensureCanvas(boolean offline) {
+def ensureCanvas(String engine, boolean offline) {
     def bin    = "${projectDir}/bin"
     def cache  = "${projectDir}/.canvas"
     def uidgid = "${['id','-u'].execute().text.trim()}:${['id','-g'].execute().text.trim()}"
@@ -162,7 +191,7 @@ def ensureCanvas(boolean offline) {
     // Reuse the cache if it already holds a loadable canvas of the right version.
     def cachedPkg = new File("${cache}/node_modules/canvas/package.json")
     def cachedVer = cachedPkg.exists() ? new groovy.json.JsonSlurper().parse(cachedPkg).version : null
-    if (cachedVer == version && canvasCacheLoads(cache, uidgid)) return "${cache}/node_modules"
+    if (cachedVer == version && canvasCacheLoads(engine, cache, uidgid)) return "${cache}/node_modules"
 
     // Installing canvas needs the network; under --offline we can only use a prebuilt cache.
     if (offline) {
@@ -172,14 +201,14 @@ def ensureCanvas(boolean offline) {
 
     log.info "Preparing native canvas@${version} for --report in ${cache} ..."
     new File(cache).mkdirs()
-    def install = ["docker", "run", "--rm", "--security-opt", "label=disable", "--user", uidgid, "-e", "HOME=/tmp",
-                   "-v", "${cache}:/c", "-w", "/c", "node:22",
-                   "npm", "install", "--no-save", "--no-audit", "--no-fund", "canvas@${version}"].execute()
+    def install = ([engine, "run", "--rm"] + hostEngineOpts(engine, uidgid) +
+                   ["-e", "HOME=/tmp", "-v", "${cache}:/c", "-w", "/c", "node:22",
+                    "npm", "install", "--no-save", "--no-audit", "--no-fund", "canvas@${version}"]).execute()
     install.consumeProcessOutputStream(System.out)
     install.consumeProcessErrorStream(System.err)
     install.waitFor()
 
-    if (install.exitValue() != 0 || !canvasCacheLoads(cache, uidgid)) return null
+    if (install.exitValue() != 0 || !canvasCacheLoads(engine, cache, uidgid)) return null
 
     log.info "Native 'canvas' ready."
     return "${cache}/node_modules"
@@ -196,7 +225,24 @@ workflow {
     def offline = (params.offline == true || params.offline == 'true')
     def force   = (params.updateDnatco == true || params.updateDnatco == 'true')
 
-    ensureDocker(offline)
+    // Container engine. docker and podman are both run by Nextflow natively (the engine is
+    // selected in nextflow.config) and used directly by our manual engine calls below.
+    def engine = params.containerEngine
+    if (engine == 'container') {
+        error """
+        ERROR: --containerEngine 'container' (Apple container) is not supported yet.
+
+        Nextflow has no native driver for Apple's 'container' engine, so the per-process
+        containers cannot be run through it. Until that's wired up, use Docker/podman here,
+        or put a 'docker'-named wrapper that forwards to 'container' first on your PATH
+        before launching the pipeline.
+        """.stripIndent()
+    }
+    if (!(engine in ['docker', 'podman'])) {
+        error "ERROR: unsupported --containerEngine '${engine}'. Supported engines: docker, podman."
+    }
+
+    ensureEngine(engine, offline)
     ensureDnatco(offline, force)
 
     if (infoFlag) {
@@ -230,9 +276,9 @@ workflow {
 
         // dnatco.js switches the pipeline disables: either it sets them itself (so a user
         // value would be overwritten) or the feature isn't supported here. None are forwarded
-        // to dnatco.js (see the 'managed' list in the DNATCO_CLASSIFY module). They aren't
-        // declared in nextflow.config, so a non-null value means the user passed it — warn
-        // for each so an ignored switch never looks effective.
+        // to dnatco.js (see the 'managed' list in the DNATCO_CLASSIFY module). Each defaults
+        // to null in nextflow.config, so a non-null value means the user passed it — warn for
+        // each so an ignored switch never looks effective.
         def disabledSwitches = [
             prefix   : "the pipeline derives the output prefix from the input name and --outpref",
             outputDir: "the pipeline always writes outputs into the task/publish directory",
@@ -251,7 +297,7 @@ workflow {
         // remaining outputs are still produced. canvasMount = '' means "no --report".
         def canvasMount = ''
         if (params.report == true || params.report == 'true') {
-            canvasMount = ensureCanvas(offline) ?: ''
+            canvasMount = ensureCanvas(engine, offline) ?: ''
             if (!canvasMount) {
                 log.warn "--report PDF will NOT be generated: a working 'canvas' module could not " +
                          "be prepared on this platform. Continuing with the other outputs."

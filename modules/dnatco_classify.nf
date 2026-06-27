@@ -48,7 +48,7 @@ process DNATCO_CLASSIFY {
     // "true", while config defaults (extendedCIF = true) are real booleans; treat
     // both alike so a switch never gets a spurious "true" value appended.
     def managed = ['input', 'coords', 'reflns', 'prefix', 'outputDir', 'outpref', 'dnatco_bin',
-                   'help', 'version', 'report', 'updateDnatco', 'offline']
+                   'help', 'version', 'report', 'updateDnatco', 'offline', 'containerEngine']
     def passThrough = params
         .findAll { k, v -> !(k in managed) && v != null && v != false && v != 'false' }
         .collect { k, v -> (v == true || v == 'true') ? "--${k}" : "--${k} ${v}" }
