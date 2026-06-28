@@ -38,6 +38,12 @@ def engineProbe(List<String> args) {
 }
 
 def engineResponds(String engine) {
+    // Apple 'container' has no 'info' subcommand; just confirm the CLI is present. Nextflow's
+    // appleContainer driver reports a clear error if its service isn't up ('container system
+    // start'). docker/podman: 'info' is canonical, with an image listing as fallback.
+    if (engine == 'container') {
+        return engineProbe([engine, '--version'])
+    }
     return engineProbe([engine, 'info']) || engineProbe([engine, 'image', 'ls'])
 }
 
@@ -58,13 +64,16 @@ def ensureEngine(String engine, boolean offline) {
     // dnatco.js only ever runs inside the 'node:22' container, so a working container engine
     // is required before we attempt anything (including pulling dnatco).
     if (!engineResponds(engine)) {
+        def verify = engine == 'container'
+            ? "${engine} --version  (and start its service with 'container system start')"
+            : "${engine} info"
         error """
         ERROR: the '${engine}' container engine is not available.
 
         This pipeline runs dnatco.js inside the 'node:22' container, so a working ${engine}
-        installation with a running daemon is required.
+        installation with a running service is required.
 
-        Verify with:  ${engine} info
+        Verify with:  ${verify}
         """.stripIndent()
     }
 
@@ -225,21 +234,31 @@ workflow {
     def offline = (params.offline == true || params.offline == 'true')
     def force   = (params.updateDnatco == true || params.updateDnatco == 'true')
 
-    // Container engine. docker and podman are both run by Nextflow natively (the engine is
-    // selected in nextflow.config) and used directly by our manual engine calls below.
+    // Container engine. docker, podman and Apple 'container' are all run by Nextflow natively
+    // (the engine is selected in nextflow.config) and used directly by our manual engine calls
+    // below. Apple 'container' requires Nextflow >= 26.04 on Apple silicon.
     def engine = params.containerEngine
-    if (engine == 'container') {
-        error """
-        ERROR: --containerEngine 'container' (Apple container) is not supported yet.
-
-        Nextflow has no native driver for Apple's 'container' engine, so the per-process
-        containers cannot be run through it. Until that's wired up, use Docker/podman here,
-        or put a 'docker'-named wrapper that forwards to 'container' first on your PATH
-        before launching the pipeline.
-        """.stripIndent()
+    if (!(engine in ['docker', 'podman', 'container'])) {
+        error "ERROR: unsupported --containerEngine '${engine}'. Supported engines: docker, podman, container."
     }
-    if (!(engine in ['docker', 'podman'])) {
-        error "ERROR: unsupported --containerEngine '${engine}'. Supported engines: docker, podman."
+
+    // Apple 'container' is driven by Nextflow's native appleContainer support, added in 26.04.
+    // On macOS with an older Nextflow the scope is silently ignored and tasks would run without
+    // an engine, so fail early with an upgrade hint. (Apple container is macOS/Apple-silicon
+    // only; on other hosts the engine probe below reports it as unavailable instead.)
+    if (engine == 'container' && !isLinuxHost() && !workflow.nextflow.version.matches('>=26.04')) {
+        error """
+        ERROR: --containerEngine 'container' (Apple container) requires Nextflow >= 26.04,
+        but this is Nextflow ${workflow.nextflow.version}.
+
+        Update Nextflow, e.g.:
+            nextflow self-update
+          or pin a recent version for a single run:
+            NXF_VER=26.04.0 nextflow run ...
+
+        Alternatively use --containerEngine docker with the bundled 'docker' wrapper (see the
+        README's docker section), which drives Apple container on older Nextflow.
+        """.stripIndent()
     }
 
     ensureEngine(engine, offline)

@@ -1,0 +1,44 @@
+#!/bin/bash
+#
+# docker -> Apple `container` shim.
+#
+# Apple's `container` CLI shares most of docker's syntax, but `container run` rejects
+# several options that Nextflow injects into its `docker run` line (e.g. `--cpu-shares`,
+# derived from the task's `cpus` directive). This wrapper drops those options — and the
+# value token that follows them — and forwards everything else to `container`.
+#
+# Put this file's directory ahead of the real docker on PATH *before* `nextflow run`
+# (Nextflow resolves `docker` from the launch environment; see the pipeline notes).
+#
+# `docker info` is intentionally NOT shimmed: the pipeline's engine probe falls back to
+# `docker image ls` (-> `container image ls`), so engine detection works through the rename.
+#
+# Extend the two lists below as you hit further incompatible options.
+
+# Options dropped together WITH their following value (`--opt value` or `--opt=value`):
+drop_with_value=(--cpu-shares --cpu-quota --cpu-period --memory-swap --memory-swappiness --pids-limit)
+# Options dropped as a bare flag (no value):
+drop_flag=()
+
+args=()
+skip=0
+for tok in "$@"; do
+    # Skip the value belonging to a dropped `--opt value` option.
+    if (( skip )); then skip=0; continue; fi
+
+    drop=0
+    for d in "${drop_with_value[@]}"; do
+        if [[ "$tok" == "$d" ]]; then drop=1; skip=1; break; fi   # `--opt value`: also drop next token
+        if [[ "$tok" == "$d="* ]]; then drop=1; break; fi         # `--opt=value`: single token
+    done
+    if (( drop )); then continue; fi
+
+    for d in "${drop_flag[@]}"; do
+        if [[ "$tok" == "$d" ]]; then drop=1; break; fi
+    done
+    if (( drop )); then continue; fi
+
+    args+=("$tok")
+done
+
+exec container "${args[@]}"
